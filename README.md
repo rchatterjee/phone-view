@@ -1,4 +1,8 @@
-# PhoneView
+# PhoneView (phone-controller)
+
+A tool to view and control phones from a laptop, and potentially remotely, for
+security clinics. The phone's owner has to unlock the phone and follow the steps
+to establish the connection, every time.
 
 View and control a USB-connected phone from a browser. One small Python process
 on the host (Windows, Linux, Raspberry Pi, thin client) relays the phone's screen to
@@ -202,3 +206,7 @@ Earlier iOS 17 hardware findings (HID behaviour, App switcher, timing) are kept 
   unlocked with Developer Mode on. The first mount downloads the image from GitHub.
 - **WSL:** USB devices are not visible inside WSL without `usbipd` passthrough. Run
   PhoneView on Windows directly, or attach the phone with `usbipd attach`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
