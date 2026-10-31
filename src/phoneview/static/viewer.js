@@ -3,7 +3,7 @@
 // forwards pointer/keyboard input, and builds its controls from the backend's
 // capabilities. No framework, no build step.
 
-// ---- pure helpers (unit-tested in tests/test_viewer.cjs) --------------------
+// ---- pure helpers (unit-tested in tests/test_viewer_js.cjs) --------------------
 
 const COORD_MAX = 65535;
 const MSG_VIDEO = 1, MSG_JPEG = 2;
