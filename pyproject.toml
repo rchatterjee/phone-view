@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phoneview"
+version = "0.2.0"
+description = "Browser-based viewing and control of USB-connected Android phones and iPhones"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "Pillow>=11",
+    # iPhone support. Pinned to a tested minor: its CoreDevice APIs change between releases.
+    "pymobiledevice3>=11.49,<11.50",
+]
+
+[project.optional-dependencies]
+dev = ["httpx>=0.28,<1", "websockets>=12"]
+
+[project.scripts]
+phoneview = "phoneview.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+phoneview = ["static/*"]

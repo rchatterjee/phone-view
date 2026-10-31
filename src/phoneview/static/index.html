@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhoneView</title>
+<link rel="stylesheet" href="/static/viewer.css">
+<script src="/static/viewer.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>PhoneView</h1>
+  <div id="device" role="status">Connecting…</div>
+  <div id="error" role="alert" hidden></div>
+  <div id="note" hidden></div>
+</header>
+
+<main>
+  <section id="stage">
+    <canvas id="screen" class="empty" tabindex="0" aria-label="Phone screen. Click to tap, drag to swipe, type to enter text." width="0" height="0"></canvas>
+    <div id="placeholder">Waiting for the phone screen…</div>
+  </section>
+
+  <aside id="panel">
+    <div id="nav" class="buttons" aria-label="Phone buttons"></div>
+    <div id="commands" class="buttons" aria-label="System actions"></div>
+
+    <form id="text-form" hidden>
+      <label for="text-input">Type on the phone</label>
+      <div class="row">
+        <input id="text-input" maxlength="300" autocomplete="off" spellcheck="false">
+        <button type="submit">Send</button>
+      </div>
+      <p class="hint">Or click the screen and type directly. Ctrl+V pastes.</p>
+    </form>
+
+    <p id="feedback" role="status"></p>
+    <p id="metrics"></p>
+    <p id="control-mode" class="hint"></p>
+
+    <section id="setup" hidden aria-label="Phone setup">
+      <h2>Setup</h2>
+      <p id="setup-status"></p>
+      <div id="devmode-guide" hidden>
+        <p>Enable Developer Mode on the iPhone:</p>
+        <ol>
+          <li>Keep the phone connected by USB. Unlock it and accept <strong>Trust This Computer</strong>.</li>
+          <li>Open <strong>Settings → Privacy &amp; Security → Developer Mode</strong> (near the bottom). Close and reopen Settings if it was already open.</li>
+          <li>Turn on <strong>Developer Mode</strong> and accept <strong>Restart</strong>.</li>
+          <li>After the restart, unlock the phone, tap <strong>Turn On</strong>, and enter the passcode on the phone if asked. The passcode never leaves the phone.</li>
+        </ol>
+        <p class="hint">PhoneView rechecks automatically. If the option is missing, use <em>Reveal Developer Mode setting</em> and reopen Settings.</p>
+      </div>
+      <div id="setup-buttons" class="buttons"></div>
+    </section>
+
+    <details id="settings-box" hidden>
+      <summary>Stream settings</summary>
+      <form id="settings-form"></form>
+    </details>
+
+    <button id="reconnect" hidden>Reconnect</button>
+  </aside>
+</main>
+</body>
+</html>
