@@ -10,7 +10,10 @@ from starlette.websockets import WebSocketDisconnect
 
 from phoneview.backends.auto import AutoBackend
 from phoneview.backends.base import Backend, capabilities
+from phoneview.security import COOKIE, Access, normalise_origin, viewer_identity
 from phoneview.server import create_app, parse_args, build_backend
+
+TOKEN = "t" * 43
 
 ORIGIN = {"origin": "http://127.0.0.1:8000"}
 WS_URL = "ws://127.0.0.1:8000/ws"
@@ -65,10 +68,63 @@ def receive_until(ws, predicate, limit=50):
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.backend = FakeBackend()
-        self.app = create_app(self.backend)
+        self.access = Access(TOKEN, 8000, ["https://Laptop.tail1.ts.net:8443/"])
+        self.app = create_app(self.backend, self.access)
 
-    def client(self, **kwargs):
-        return TestClient(self.app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 50123), **kwargs)
+    def raw_client(self, base_url="http://127.0.0.1:8000"):
+        return TestClient(self.app, base_url=base_url, client=("127.0.0.1", 50123), follow_redirects=False)
+
+    def client(self):
+        """A signed-in browser."""
+        client = self.raw_client()
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        login = client.get(f"/?token={TOKEN}")
+        self.assertEqual(login.status_code, 303)
+        return _Entered(client)
+
+    def test_token_login_sets_cookie_and_strips_token(self):
+        with self.raw_client() as client:
+            self.assertEqual(client.get("/").status_code, 403)
+            self.assertIn("Access denied", client.get("/").text)
+            self.assertEqual(client.get("/?token=wrong").status_code, 403)
+            self.assertEqual(client.get("/static/viewer.js").status_code, 200)   # no secrets in static files
+            login = client.get(f"/?token={TOKEN}")
+            self.assertEqual((login.status_code, login.headers["location"]), (303, "/"))
+            cookie = login.headers["set-cookie"]
+            self.assertIn("httponly", cookie.lower())
+            self.assertIn("samesite=strict", cookie.lower())
+            self.assertNotIn("secure", cookie.lower())      # plain http on loopback
+            self.assertNotIn(TOKEN, cookie)                 # the cookie is a session id, not the token
+            self.assertEqual(client.get("/").status_code, 200)
+            client.cookies.set(COOKIE, "forged")
+            self.assertEqual(client.get("/").status_code, 403)
+
+    def test_websocket_needs_session(self):
+        with self.raw_client() as client:
+            with self.assertRaises(WebSocketDisconnect) as ctx:
+                with client.websocket_connect(WS_URL, headers=ORIGIN) as ws:
+                    ws.receive_text()
+            self.assertEqual(ctx.exception.code, 1008)
+            self.assertIsNone(self.app.state.controller)
+
+    def test_tailscale_serve_origin_and_identity(self):
+        base = "https://laptop.tail1.ts.net:8443"
+        with self.raw_client(base) as client:
+            login = client.get(f"/?token={TOKEN}")
+            self.assertIn("secure", login.headers["set-cookie"].lower())   # reached over HTTPS
+            headers = {"origin": base, "tailscale-user-login": "alice@example.com",
+                       "tailscale-user-name": "Alice"}
+            with client.websocket_connect("wss://laptop.tail1.ts.net:8443/ws", headers=headers) as ws:
+                status = receive_until(ws, lambda m: isinstance(m, dict) and m.get("type") == "status")
+                self.assertEqual(status["viewer"], "Alice <alice@example.com>")
+            for origin in ("https://evil.tail1.ts.net:8443", "http://laptop.tail1.ts.net:8443"):
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect("wss://laptop.tail1.ts.net:8443/ws",
+                                                  headers={"origin": origin}) as ws:
+                        ws.receive_text()
+        with self.raw_client("http://other.tail1.ts.net") as client:
+            self.assertEqual(client.get("/").status_code, 400)          # unknown Host
 
     def test_page_and_static_with_security_headers(self):
         with self.client() as client:
@@ -81,7 +137,7 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(client.get("/static/secret.txt").status_code, 404)
 
     def test_remote_peers_and_bad_hosts_refused(self):
-        with TestClient(self.app, client=("192.168.1.2", 12)) as client:
+        with TestClient(self.app, base_url="http://127.0.0.1:8000", client=("192.168.1.2", 12)) as client:
             self.assertEqual(client.get("/").status_code, 403)
         with self.client() as client:
             self.assertEqual(client.get("/", headers={"host": "evil.example"}).status_code, 400)
@@ -148,6 +204,47 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(build_backend(args).settings.max_size, 800)
         _, args = parse_args(["--platform", "ios", "--ios-video", "screenshot"])
         self.assertEqual(build_backend(args).settings.video_mode, "screenshot")
+
+
+class _Entered:
+    """Lets `with self.client() as client:` work on an already-open client."""
+    def __init__(self, client):
+        self.client = client
+
+    def __enter__(self):
+        return self.client
+
+    def __exit__(self, *exc):
+        return False
+
+
+class SecurityUnitTests(unittest.TestCase):
+    def test_origins(self):
+        self.assertEqual(normalise_origin("https://A.ts.net:443/"), ("https://a.ts.net", "a.ts.net"))
+        for bad in ("ftp://x", "https://x/path", "https://x?q=1", "laptop"):
+            with self.assertRaises(ValueError):
+                normalise_origin(bad)
+        access = Access(TOKEN, 8000, ["https://a.ts.net:8443"])
+        self.assertTrue(access.origin_allowed("http://127.0.0.1:8000"))
+        self.assertTrue(access.origin_allowed("https://a.ts.net:8443"))
+        self.assertFalse(access.origin_allowed("http://127.0.0.1:9999"))
+        self.assertFalse(access.origin_allowed("null"))
+        with self.assertRaises(ValueError):
+            Access("short", 8000)
+
+    def test_identity_only_from_loopback(self):
+        headers = {"tailscale-user-login": "bob@example.com"}
+        self.assertEqual(viewer_identity(headers, "127.0.0.1"), "bob@example.com")
+        self.assertIsNone(viewer_identity(headers, "10.0.0.5"))
+        self.assertEqual(viewer_identity({}, "::1"), "local browser")
+
+    def test_session_cap(self):
+        access = Access(TOKEN, 8000)
+        first = access.new_session()
+        for _ in range(40):
+            access.new_session()
+        self.assertFalse(access.valid_session(first))
+        self.assertEqual(len(access.sessions), 32)
 
 
 class AutoBackendTests(unittest.IsolatedAsyncioTestCase):

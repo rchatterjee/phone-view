@@ -160,6 +160,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
       const parts = [d.name, `${d.os} ${d.version || ''}`.trim()];
       if (msg.mode) parts.push({stream: 'live video', screenshot: 'screenshots', legacy: 'screenshots (iOS 15–16)'}[msg.mode] || msg.mode);
       if (msg.platform === 'android') parts.push(msg.streaming ? 'live video' : 'idle');
+      if (msg.viewer && msg.viewer !== 'local browser') parts.push(`viewing as ${msg.viewer}`);
       deviceEl.textContent = parts.filter(Boolean).join(' · ');
     } else {
       deviceEl.textContent = msg.platform === 'none' ? 'No phone connected' : 'Waiting for the phone…';

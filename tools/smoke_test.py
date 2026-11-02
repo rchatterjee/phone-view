@@ -1,12 +1,14 @@
 """Read-only live check against a running PhoneView with a phone attached.
 
 Never saves frames or sends input. Run while `python -m phoneview` is serving:
-    python tools/smoke_test.py --port 8000
+    PHONEVIEW_TOKEN=<token from the startup link> python tools/smoke_test.py --port 8000
 """
 import argparse
 import asyncio
 import json
+import os
 import time
+import urllib.error
 import urllib.request
 
 import websockets
@@ -14,13 +16,24 @@ import websockets
 
 async def check(port, seconds):
     base = f"http://127.0.0.1:{port}"
-    with urllib.request.urlopen(base, timeout=5) as response:
-        assert response.status == 200
-        assert response.headers["Cache-Control"] == "no-store"
+    token = os.environ.get("PHONEVIEW_TOKEN")
+    assert token, "Set PHONEVIEW_TOKEN to the token from the PhoneView startup link"
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    try:
+        urllib.request.build_opener(NoRedirect).open(f"{base}/?token={token}", timeout=5)
+        raise AssertionError("Expected a redirect after signing in")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 303, f"Sign-in failed (HTTP {exc.code}); is the token right?"
+        cookie = exc.headers["Set-Cookie"].split(";", 1)[0]
     video = jpeg = keys = 0
     status, caps, config = {}, {}, None
     deadline = time.monotonic() + seconds
-    async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=base, max_size=16 << 20) as ws:
+    async with websockets.connect(f"ws://127.0.0.1:{port}/ws", origin=base, max_size=16 << 20,
+                                  additional_headers={"Cookie": cookie}) as ws:
         while time.monotonic() < deadline:
             message = await asyncio.wait_for(ws.recv(), 5)
             if isinstance(message, bytes):

@@ -35,7 +35,7 @@ def video_header(key, pts):
     return struct.pack(">BBQ", MSG_VIDEO, 1 if key else 0, pts & 0xFFFFFFFFFFFFFFFF)
 
 
-async def serve(backend, ws):
+async def serve(backend, ws, viewer=None):
     send_lock = asyncio.Lock()
     sub = backend.hub.subscribe()
     pacer = BandwidthPacer()
@@ -168,7 +168,7 @@ async def serve(backend, ws):
             if encoded != last_caps:
                 last_caps = encoded
                 await send_json({"type": "capabilities", **caps})
-            await send_json(backend.full_status())
+            await send_json({**backend.full_status(), "viewer": viewer})
             backend.state_changed.clear()
             try:
                 await asyncio.wait_for(backend.state_changed.wait(), STATUS_INTERVAL)

@@ -1,14 +1,32 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "phoneview"
-version = "0.2.0"
-description = "Browser-based viewing and control of USB-connected Android phones and iPhones"
+dynamic = ["version"]
+description = "View and control a USB-connected Android phone or iPhone from a browser"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Rahul Chatterjee" }]
 requires-python = ">=3.11"
+keywords = ["android", "iphone", "screen-mirroring", "scrcpy", "remote-control", "webcodecs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Intended Audience :: Information Technology",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Hardware :: Universal Serial Bus (USB)",
+]
 dependencies = [
     "fastapi>=0.115,<1",
     "uvicorn>=0.34,<1",
@@ -18,13 +36,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28,<1", "websockets>=12"]
+dev = ["httpx>=0.28,<1", "websockets>=12", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/rchatterjee/phone-controller"
+Source = "https://github.com/rchatterjee/phone-controller"
+Issues = "https://github.com/rchatterjee/phone-controller/issues"
 
 [project.scripts]
 phoneview = "phoneview.server:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "phoneview.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-phoneview = ["static/*"]
+phoneview = ["static/index.html", "static/viewer.js", "static/viewer.css"]

@@ -26,9 +26,11 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from phoneview.android.scrcpy import h264_codec_string, split_annexb  # noqa: E402
 from phoneview.backends.base import Backend, capabilities  # noqa: E402
+from phoneview.security import Access  # noqa: E402
 from phoneview.server import create_app  # noqa: E402
 
 W, H = 360, 640
+TOKEN = Access.generate_token()
 
 
 def make_clip(w=W, h=H):
@@ -116,7 +118,7 @@ async def browser_checks(port, backend):
         page = await context.new_page()
         errors = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        await page.goto(f"http://127.0.0.1:{port}/")
+        await page.goto(f"http://127.0.0.1:{port}/?token={TOKEN}")
         await page.wait_for_function("document.getElementById('screen').width === 360", timeout=15000)
         results["h264_supported"] = await page.evaluate(
             "VideoDecoder.isConfigSupported({codec: 'avc1.42c01e'}).then(r => r.supported)")
@@ -162,7 +164,8 @@ async def browser_checks(port, backend):
 def main():
     backend = FakeBackend(make_clip(), make_clip(640, 360))
     port = free_port()
-    config = uvicorn.Config(create_app(backend), host="127.0.0.1", port=port, log_level="warning")
+    config = uvicorn.Config(create_app(backend, Access(TOKEN, port)), host="127.0.0.1", port=port,
+                            log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()

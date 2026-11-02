@@ -13,18 +13,28 @@ a local web page and sends your clicks, drags and typing back to the phone.
 | Android 5.0+ | Live H.264, up to 60 fps (scrcpy 5.0.1 server) | Multi-touch, keys, typing, scroll, rotate | USB debugging on; `adb` on the host |
 | iPhone, iOS 27+ | Live HEVC (CoreDevice stream, pymobiledevice3 serve-web); falls back to screenshots | Touch, buttons | Developer Mode |
 | iPhone, iOS 17–26 | Screenshots, ~1–5 fps (DVT) | Live touch, buttons, typing (CoreDevice HID) | Developer Mode |
-| iPhone, iOS 15–16 | Screenshots (screenshotr; Developer Disk Image auto-mounted) | Only if WebDriverAgent is installed ([docs/ios-wda.md](docs/ios-wda.md)); then also faster MJPEG video | Developer Mode (iOS 16) |
+| iPhone, iOS 15–16 | Screenshots (screenshotr; Developer Disk Image auto-mounted) | Only if WebDriverAgent is installed ([docs/ios-wda.md](https://github.com/rchatterjee/phone-controller/blob/main/docs/ios-wda.md)); then also faster MJPEG video | Developer Mode (iOS 16) |
 
 The host never decodes or re-encodes Android video; it only copies packets, so a
 Raspberry Pi or Wyse 3040 is enough. The browser decodes with WebCodecs.
 
 ## Install
 
-Python 3.11+.
+Python 3.11+. Install it as a standalone tool, in its own environment:
+
+```bash
+pipx install phoneview          # or: uv tool install phoneview
+```
+
+`pip install phoneview` into a virtual environment works too. PhoneView pins
+pymobiledevice3 to 11.49.x. ISDi uses the same range, so ISDi users install both
+together with `pip install "isdi-scanner[phoneview]"` (see ISDi's README).
+
+From a checkout, for development:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e .            # Windows: .venv\Scripts\pip install -e .
+.venv/bin/pip install -e .[dev]       # Windows: .venv\Scripts\pip install -e .[dev]
 ```
 
 Platform pieces:
@@ -51,8 +61,10 @@ On the phone:
 phoneview                  # or: python -m phoneview
 ```
 
-Open **http://127.0.0.1:8000** on the same machine. PhoneView detects whether an
-Android phone or an iPhone is plugged in and switches automatically.
+PhoneView prints a link like `http://127.0.0.1:8000/?token=…` and opens it in your
+browser. The token is new on every start; without it the page shows "Access denied".
+PhoneView detects whether an Android phone or an iPhone is plugged in and switches
+automatically. It can also be started from ISDi's **PhoneView** button (see below).
 
 Using the page:
 
@@ -76,19 +88,42 @@ Useful options (`phoneview --help` lists all):
 --ios-video auto|stream|screenshot            iPhone video route
 --width 480 --quality 65 --active-fps 3 --idle-fps 0.5 --bandwidth-mbps 1.5   iPhone screenshots
 --tunnel | --rsd HOST PORT    iOS 17+ tunnel options (see docs/ios-mvp-notes.md)
+--public-origin URL           allow a local reverse proxy's origin (tailscale serve)
+--audit-log FILE              append who viewed which phone, and when (JSON lines)
+--no-browser                  print the link only
 ```
 
-### Viewing from another computer (headless Pi / thin client)
+### Viewing from another computer: `tailscale serve`
 
-PhoneView only listens on 127.0.0.1 and has no login, by design. Reach it through SSH,
-which authenticates you and keeps the page on `127.0.0.1`. Browsers only enable the
-WebCodecs video decoder on `localhost`/HTTPS pages:
+PhoneView always listens on 127.0.0.1. For remote viewing, let Tailscale publish it
+inside your tailnet over HTTPS, on the machine the phone is plugged into:
 
 ```bash
-ssh -N -L 8000:127.0.0.1:8000 user@pi-host     # then open http://127.0.0.1:8000 locally
+tailscale serve --bg --https=8443 http://127.0.0.1:8000
+phoneview --public-origin https://laptop.tailnet.ts.net:8443
 ```
 
-Do not expose the port through a proxy or change the bind address.
+Then open `https://laptop.tailnet.ts.net:8443/?token=…` with the token from the
+startup link. HTTPS also enables the browser's video decoder remotely.
+
+- Use `tailscale serve`, **never `tailscale funnel`**: funnel publishes to the internet.
+- Restrict who can reach port 8443 with a tailnet access rule (for example,
+  only `group:consultants` to `tag:clinic-laptop`).
+- Do not change the bind address; the token is not meant to stand alone on a network.
+
+Without Tailscale, an SSH tunnel works the same way:
+`ssh -N -L 8000:127.0.0.1:8000 user@host`, then open the link locally.
+
+### Starting from ISDi
+
+ISDi shows a **PhoneView** button when PhoneView is installed with it
+(`pip install "isdi-scanner[phoneview]"`), is on its `PATH`, or `ISDI_PHONEVIEW_CMD`
+points to it. Pressing it starts PhoneView on port 6201 if it
+is not already running, then opens it in a new tab, already signed in. When the
+consultant arrived through `tailscale serve`, the link points at
+`https://<same host>:8443` (override with `ISDI_PHONEVIEW_PUBLIC_URL`). PhoneView
+stops when ISDi stops, including when ISDi is killed. For remote use, also serve
+that port: `tailscale serve --bg --https=8443 http://127.0.0.1:6201`.
 
 ### Running as a service (Linux)
 
@@ -115,7 +150,7 @@ access to the usbmuxd socket for iPhones.
 ```
 browser (WebCodecs / JPEG, pointer + keys)
    │  one WebSocket: binary video/JPEG frames, JSON status + input
-host: session layer (loopback + origin checks, one controller, backpressure, input validation)
+host: session layer (token sign-in, host/origin checks, one controller, backpressure, input validation)
    │  Backend interface: capabilities, video, input, setup actions
    ├─ Android: adb server protocol → scrcpy server on the phone → H.264 passthrough
    ├─ iOS 27+: pymobiledevice3 ScreenStreamServer (in-process, loopback) → HEVC passthrough
@@ -124,6 +159,7 @@ host: session layer (loopback + origin checks, one controller, backpressure, inp
 ```
 
 - `src/phoneview/server.py`: app, security middleware, CLI
+- `src/phoneview/security.py`: token sign-in, session cookies, host/origin allow-lists, audit log
 - `src/phoneview/session.py`: WebSocket protocol (documented at the top of the file)
 - `src/phoneview/media.py`: fan-out; video queues resync on key frames, JPEG is latest-wins with acknowledgements
 - `src/phoneview/events.py`: the one input model every backend accepts
@@ -147,17 +183,49 @@ Robustness rules the code follows:
 - **Lightweight.** Android runs the scrcpy server only while someone is watching,
   plus 10 s of grace. iPhone screenshots drop to the idle rate when nothing changes.
 
+## Security
+
+| Layer | What it does |
+|---|---|
+| Network | Listens on 127.0.0.1 only; nothing is reachable from the LAN. Remote access goes through `tailscale serve` (TLS, tailnet membership, access rules). |
+| Sign-in | Per-run token (`PHONEVIEW_TOKEN`, or generated) → random session id in an HttpOnly, SameSite=Strict cookie (Secure over HTTPS). Every page and the WebSocket require it. The token is never a command-line argument, so other users can't read it from the process list. |
+| Requests | Host allow-list (blocks DNS rebinding), Origin allow-list on the WebSocket (blocks cross-site hijacking), strict CSP, no caching, one controller at a time. |
+| Accountability | Each view's start and end, with the tailnet login that `tailscale serve` adds (`Tailscale-User-Login`, which it strips from incoming requests), go to the log and to `--audit-log`. |
+| Data | No frames, keystrokes or clipboard contents are stored. |
+
+Not covered: anyone with an account or malware on the host machine can use the phone
+through adb or usbmuxd directly, so use a dedicated, up-to-date host.
+
+**After each clinic session, remove the trust the phone keeps:**
+
+- Android: don't tick "Always allow from this computer". Afterwards,
+  **Developer options → Revoke USB debugging authorizations**, then turn USB debugging off.
+- iPhone: **Settings → General → Transfer or Reset iPhone → Reset → Reset Location &
+  Privacy** (forgets trusted computers), then turn Developer Mode off.
+
+## Releasing to PyPI
+
+The version lives in `src/phoneview/__init__.py`. To release, bump it, tag
+`vX.Y.Z`, and publish a GitHub release; `.github/workflows/publish.yml` builds, checks
+and uploads with PyPI trusted publishing. One-time setup: on PyPI, add a trusted
+publisher for this repository, workflow `publish.yml`, environment `pypi`.
+
+To build and check by hand:
+
+```bash
+python -m build && python -m twine check dist/*
+```
+
 ## Tests
 
 ```bash
 pip install -e .[dev]
-PYTHONPATH=src python -m unittest tests.test_protocol tests.test_android tests.test_ios \
-    tests.test_server tests.test_connection tests.test_developer_mode
+python -m unittest discover -s tests
 node tests/test_viewer_js.cjs
 # Real browser against a fake phone (needs ffmpeg and `pip install playwright`):
 python tools/browser_e2e.py
-# Against a real phone, while phoneview runs:
-python tools/smoke_test.py --port 8000
+# Against a real phone, while phoneview runs (token from its startup link):
+PHONEVIEW_TOKEN=... python tools/smoke_test.py --port 8000
 ```
 
 What has and has not been verified:
@@ -187,7 +255,7 @@ Known limitations, to confirm on hardware:
   encoding until PhoneView stops. Android stops 10 s after the last viewer leaves.
 
 Earlier iOS 17 hardware findings (HID behaviour, App switcher, timing) are kept in
-[docs/ios-mvp-notes.md](docs/ios-mvp-notes.md).
+[docs/ios-mvp-notes.md](https://github.com/rchatterjee/phone-controller/blob/main/docs/ios-mvp-notes.md).
 
 ## Troubleshooting
 
@@ -209,4 +277,4 @@ Earlier iOS 17 hardware findings (HID behaviour, App switcher, timing) are kept 
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](https://github.com/rchatterjee/phone-controller/blob/main/LICENSE).
