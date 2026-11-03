@@ -286,3 +286,40 @@ class AutoBackendTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProxyHeaderTests(unittest.TestCase):
+    """Through tailscale serve the connection comes from 127.0.0.1 with X-Forwarded-For set
+    to the viewer's tailnet IP. uvicorn must not swap that in as the client address, or
+    every remote viewer gets "Local access only" (seen on a Wyse thin client, uvicorn 0.54)."""
+
+    def test_forwarded_for_does_not_replace_loopback_peer(self):
+        import http.client
+        import socket
+        import threading
+        import time
+        import uvicorn
+        from phoneview.server import server_config
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        app = create_app(FakeBackend(), Access(TOKEN, port, ["https://laptop.tail1.ts.net:8443"]))
+        server = uvicorn.Server(server_config(app, port))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(setattr, server, "should_exit", True)
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.05)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", f"/?token={TOKEN}", headers={
+            "Host": "laptop.tail1.ts.net:8443", "X-Forwarded-For": "100.101.102.103",
+            "X-Forwarded-Proto": "https", "Tailscale-User-Login": "alice@example.com"})
+        r = conn.getresponse()
+        body = r.read()
+        self.assertNotIn(b"Local access only", body)
+        self.assertEqual((r.status, r.getheader("location")), (303, "/"))
+        self.assertIn("secure", r.getheader("set-cookie").lower())

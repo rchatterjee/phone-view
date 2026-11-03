@@ -52,7 +52,31 @@ function base64ToBytes(text) {
 function decoderConfig(cfg) {
   const config = {codec: cfg.codec_string, optimizeForLatency: true};
   if (cfg.format === 'hvcc' && cfg.description) config.description = base64ToBytes(cfg.description);
+  // The real picture size, when the server knows it. Without it Chrome's HEVC decoder on
+  // Windows assumed 1280x720 for a 1184x2576 iPhone stream and showed only the top.
+  if (cfg.coded_width > 0 && cfg.coded_height > 0) {
+    config.codedWidth = cfg.coded_width; config.codedHeight = cfg.coded_height;
+  }
+  if (cfg.width > 0 && cfg.height > 0) {
+    config.displayAspectWidth = cfg.width; config.displayAspectHeight = cfg.height;
+  }
   return config;  // no description: the bitstream is Annex-B with in-band parameter sets
+}
+
+// The visible rectangle to draw, when a decoded frame reports less than the stream's real
+// picture (see decoderConfig); null when the frame is fine or cannot be corrected.
+function visibleFix(frame, cfg) {
+  const w = cfg && cfg.width, h = cfg && cfg.height;
+  if (!(w > 0 && h > 0)) return null;
+  if (frame.displayWidth === w && frame.displayHeight === h) return null;
+  if (frame.codedWidth < w || frame.codedHeight < h) return null;
+  return {x: 0, y: 0, width: w, height: h};
+}
+
+// Canvas CSS width for a "Screen size" choice; null means fit the window (the stylesheet).
+function viewWidth(choice, canvasWidth) {
+  const pct = Number(choice);
+  return pct > 0 && canvasWidth > 0 ? Math.round(canvasWidth * pct / 100) : null;
 }
 
 // Pointer ids 0..9 for the server; mouse is always 0.
@@ -86,10 +110,187 @@ const SETUP_LABELS = {
   use_screenshots: 'Use screenshots instead', retry_stream: 'Retry live video stream',
 };
 
+// Screenshot order: move `id` to just before (or after) `targetId`. Unknown ids leave it unchanged.
+function reorderIds(ids, id, targetId, after) {
+  if (id === targetId || !ids.includes(id) || !ids.includes(targetId)) return ids.slice();
+  const rest = ids.filter(x => x !== id);
+  const at = rest.indexOf(targetId) + (after ? 1 : 0);
+  rest.splice(at, 0, id);
+  return rest;
+}
+
+// Move `id` one place up (-1) or down (+1).
+function stepIds(ids, id, delta) {
+  const i = ids.indexOf(id), j = i + delta;
+  if (i < 0 || j < 0 || j >= ids.length) return ids.slice();
+  const out = ids.slice();
+  [out[i], out[j]] = [out[j], out[i]];
+  return out;
+}
+
+function shotTime(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? '' : d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {normalise, parseBinary, keyForEvent, isPrintable, base64ToBytes, decoderConfig,
-                    PointerSlots, COORD_MAX};
+                    PointerSlots, COORD_MAX, reorderIds, stepIds, visibleFix, viewWidth};
 }
+
+// ---- screenshots sidebar ---------------------------------------------------------
+
+if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded', () => {
+  const $ = id => document.getElementById(id);
+  const list = $('shot-list'), takeBtn = $('shot-take'), pdfLink = $('shot-pdf'), clearBtn = $('shot-clear');
+  const countEl = $('shot-count'), feedbackEl = $('shot-feedback'), emptyEl = $('shot-empty');
+  let items = [], dragId = null;
+  const nodes = new Map();   // id -> <li>, kept so thumbnails are not fetched again
+
+  async function api(method, path, body) {
+    const opts = {method, headers: {}};
+    if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+    const r = await fetch(path, opts);
+    let data = {};
+    try { data = await r.json(); } catch (e) { /* not JSON */ }
+    if (!r.ok) throw new Error(data.error || `Request failed (${r.status})`);
+    return data;
+  }
+
+  function say(text) { feedbackEl.textContent = text; }
+
+  function makeNode(item) {
+    const li = document.createElement('li');
+    li.className = 'shot';
+    li.draggable = true;
+    li.dataset.id = item.id;
+    const full = `/api/screenshots/${item.id}`;
+    const thumb = document.createElement('a');
+    thumb.className = 'thumb'; thumb.href = full; thumb.target = '_blank'; thumb.rel = 'noopener';
+    thumb.title = 'Open full size';
+    const img = document.createElement('img');
+    img.src = `${full}?thumb=1`; img.alt = 'Screenshot'; img.loading = 'lazy'; img.draggable = false;
+    thumb.append(img);
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const title = document.createElement('div');
+    title.className = 'title';
+    title.title = 'Drag to reorder';
+    title.append(document.createElement('b'), document.createElement('span'));
+    const caption = document.createElement('textarea');
+    caption.rows = 2; caption.maxLength = 500; caption.placeholder = 'Note (included in the PDF)';
+    caption.value = item.caption || '';
+    caption.addEventListener('change', async () => {
+      try { await api('PATCH', full, {caption: caption.value}); say('Note saved.'); }
+      catch (e) { say(e.message); }
+    });
+    const tools = document.createElement('div');
+    tools.className = 'tools';
+    const tool = (label, title, fn, cls) => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.textContent = label; b.title = title; if (cls) b.className = cls;
+      b.addEventListener('click', fn);
+      return b;
+    };
+    const download = document.createElement('a');
+    download.className = 'button'; download.href = `${full}?download=1`; download.textContent = 'Save';
+    download.title = 'Download the original image';
+    tools.append(
+      tool('↑', 'Move up', () => order(stepIds(ids(), item.id, -1))),
+      tool('↓', 'Move down', () => order(stepIds(ids(), item.id, 1))),
+      download,
+      tool('Delete', 'Delete this screenshot', () => remove(item.id), 'danger'));
+    meta.append(title, caption, tools);
+    li.append(thumb, meta);
+
+    li.addEventListener('dragstart', e => {
+      dragId = item.id; li.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', item.id);
+    });
+    li.addEventListener('dragend', () => { dragId = null; li.classList.remove('dragging'); clearMarks(); });
+    li.addEventListener('dragover', e => {
+      if (!dragId || dragId === item.id) return;
+      e.preventDefault();
+      const after = e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      clearMarks();
+      li.classList.add(after ? 'drop-after' : 'drop-before');
+    });
+    li.addEventListener('drop', e => {
+      e.preventDefault();
+      const after = li.classList.contains('drop-after');
+      clearMarks();
+      if (dragId) order(reorderIds(ids(), dragId, item.id, after));
+    });
+    return li;
+  }
+
+  function clearMarks() {
+    for (const li of nodes.values()) li.classList.remove('drop-before', 'drop-after');
+  }
+
+  function ids() { return items.map(i => i.id); }
+
+  function render(newItems, freshId) {
+    items = newItems;
+    const keep = new Set(ids());
+    for (const [id, li] of nodes) if (!keep.has(id)) { li.remove(); nodes.delete(id); }
+    items.forEach((item, i) => {
+      let li = nodes.get(item.id);
+      if (!li) { li = makeNode(item); nodes.set(item.id, li); }
+      li.querySelector('.title b').textContent = `#${i + 1}`;
+      li.querySelector('.title span').textContent = shotTime(item.taken);
+      const caption = li.querySelector('textarea');
+      if (document.activeElement !== caption) caption.value = item.caption || '';
+      li.classList.toggle('fresh', item.id === freshId);
+      list.append(li);   // moves existing nodes into the new order
+    });
+    countEl.textContent = items.length ? `(${items.length})` : '';
+    emptyEl.hidden = items.length > 0;
+    clearBtn.disabled = !items.length;
+    pdfLink.setAttribute('aria-disabled', items.length ? 'false' : 'true');
+    if (freshId && nodes.get(freshId)) nodes.get(freshId).scrollIntoView({block: 'nearest'});
+  }
+
+  async function refresh() {
+    try { render((await api('GET', '/api/screenshots')).items); }
+    catch (e) { say(e.message); }
+  }
+
+  async function order(newIds) {
+    if (newIds.join() === ids().join()) return;
+    try { render((await api('PUT', '/api/screenshots/order', {ids: newIds})).items); }
+    catch (e) { say(e.message); refresh(); }
+  }
+
+  async function remove(id) {
+    try { render((await api('DELETE', `/api/screenshots/${id}`)).items); say('Screenshot deleted.'); }
+    catch (e) { say(e.message); }
+  }
+
+  takeBtn.addEventListener('click', async () => {
+    takeBtn.disabled = true;
+    say('Capturing the screen…');
+    try {
+      const shot = await api('POST', '/api/screenshots');
+      const fresh = (await api('GET', '/api/screenshots')).items;
+      render(fresh, shot.id);
+      say(`Screenshot #${fresh.findIndex(i => i.id === shot.id) + 1} saved (${shot.width}×${shot.height}).`);
+    } catch (e) {
+      say(e.message);
+    } finally {
+      takeBtn.disabled = false;
+    }
+  });
+
+  clearBtn.addEventListener('click', async () => {
+    if (!confirm(`Delete all ${items.length} screenshots? This cannot be undone.`)) return;
+    try { render((await api('DELETE', '/api/screenshots')).items); say('All screenshots deleted.'); }
+    catch (e) { say(e.message); }
+  });
+
+  refresh();
+});
 
 // ---- browser app ---------------------------------------------------------------
 
@@ -106,7 +307,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   let ws = null, retryTimer = null, generation = null;
   let caps = {keys: [], commands: [], setup: [], settings: []};
   let status = {};
-  let decoder = null, needKey = true, videoCfg = null, decodeFailures = 0;
+  let decoder = null, needKey = true, videoCfg = null, decodeFailures = 0, frameInfo = '';
   let decodedFrames = 0, fpsTime = performance.now(), displayFps = 0;
   const slots = new PointerSlots();
   const pendingMoves = new Map();
@@ -116,7 +317,9 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   function connect() {
     clearTimeout(retryTimer);
     reconnectBtn.hidden = true;
-    ws = new WebSocket(`ws://${location.host}/ws`);
+    // wss: behind tailscale serve (HTTPS); browsers block ws: from an https: page.
+    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${scheme}://${location.host}/ws`);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => { deviceEl.textContent = 'Connected. Looking for a phone…'; };
     ws.onmessage = e => (typeof e.data === 'string' ? onText(JSON.parse(e.data)) : onBinary(e.data));
@@ -180,6 +383,10 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     if (msg.mbps !== undefined) bits.push(`${msg.mbps} Mbps`);
     if (msg.capture_fps !== undefined) bits.push(`capture ${msg.capture_fps} fps`);
     if (msg.screenshot_ms) bits.push(`screenshot ${msg.screenshot_ms} ms`);
+    // Decoder geometry, for diagnosing cropped or stretched video.
+    if (frameInfo && videoCfg) {
+      bits.push(`frame ${frameInfo}` + (videoCfg.width ? `, stream ${videoCfg.width}×${videoCfg.height}` : ''));
+    }
     return bits.join(' · ');
   }
 
@@ -206,6 +413,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   // wire, and an async support check would let it slip past an unready decoder.
   // An unsupported config surfaces through the error callback instead.
   function configureVideo(cfg) {
+    frameInfo = '';
     if (!cfg.codec || cfg.codec === 'jpeg') return resetVideo();
     closeDecoder();
     videoCfg = cfg;
@@ -214,7 +422,19 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     }
     let decodedSinceConfig = 0;
     const current = new VideoDecoder({
-      output: frame => { decodedSinceConfig++; decodeFailures = 0; draw(frame, frame.displayWidth, frame.displayHeight); frame.close(); },
+      output: frame => {
+        decodedSinceConfig++; decodeFailures = 0;
+        frameInfo = `${frame.displayWidth}×${frame.displayHeight} (coded ${frame.codedWidth}×${frame.codedHeight}, ` +
+                    `visible ${frame.visibleRect ? frame.visibleRect.width + '×' + frame.visibleRect.height : '?'})`;
+        const rect = visibleFix(frame, cfg);
+        if (rect) {
+          let fixed = null;
+          try { fixed = new VideoFrame(frame, {visibleRect: rect, displayWidth: rect.width, displayHeight: rect.height}); }
+          catch (_) { /* not correctable: draw what the decoder gave */ }
+          if (fixed) { draw(fixed, rect.width, rect.height); fixed.close(); frame.close(); return; }
+        }
+        draw(frame, frame.displayWidth, frame.displayHeight); frame.close();
+      },
       error: err => {
         if (decoder !== current) return;
         decodeFailures++;
@@ -274,6 +494,7 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   function draw(image, width, height) {
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width; canvas.height = height;
+      applyViewSize();
     }
     ctx.drawImage(image, 0, 0, width, height);
     canvas.classList.remove('empty');
@@ -466,6 +687,20 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
       })));
     }
   }
+
+  // -- screen size (viewer only; the phone decides the stream resolution) -------------
+  const sizeSelect = $('view-size');
+  try { sizeSelect.value = localStorage.getItem('phoneview.viewSize') || 'fit'; } catch (_) { sizeSelect.value = 'fit'; }
+  function applyViewSize() {
+    const width = viewWidth(sizeSelect.value, canvas.width);
+    canvas.classList.toggle('sized', width !== null);
+    canvas.style.width = width === null ? '' : `${width}px`;
+  }
+  sizeSelect.addEventListener('change', () => {
+    try { localStorage.setItem('phoneview.viewSize', sizeSelect.value); } catch (_) { /* private mode */ }
+    applyViewSize();
+  });
+  applyViewSize();
 
   reconnectBtn.addEventListener('click', () => { if (!ws || ws.readyState === WebSocket.CLOSED) connect(); });
   window.addEventListener('pagehide', () => { if (ws) ws.close(); });

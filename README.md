@@ -78,6 +78,13 @@ Using the page:
   only when the connected phone supports them.
 - **Stream settings** adjusts resolution, fps and bit rate (Android), or
   screenshot size, quality, fps and bandwidth budget (iPhone) without reconnecting.
+- **Screenshots** (right-hand column): **Take screenshot** captures the phone's
+  screen at full resolution (Android `screencap`; iPhone screenshot service), not
+  the scaled-down video. Each one is listed with its number and time; add a note,
+  move it up or down (or drag it), save the original PNG, or delete it.
+  **Download all as PDF** exports them in that order, one per page, with the time,
+  device, note and the original's SHA-256. Apps that block screen capture (some
+  banking apps) give a black image.
 
 Useful options (`phoneview --help` lists all):
 
@@ -90,6 +97,7 @@ Useful options (`phoneview --help` lists all):
 --tunnel | --rsd HOST PORT    iOS 17+ tunnel options (see docs/ios-mvp-notes.md)
 --public-origin URL           allow a local reverse proxy's origin (tailscale serve)
 --audit-log FILE              append who viewed which phone, and when (JSON lines)
+--screenshot-dir DIR          keep screenshots in DIR so they survive a restart (default: memory)
 --no-browser                  print the link only
 ```
 
@@ -122,7 +130,9 @@ points to it. Pressing it starts PhoneView on port 6201 if it
 is not already running, then opens it in a new tab, already signed in. When the
 consultant arrived through `tailscale serve`, the link points at
 `https://<same host>:8443` (override with `ISDI_PHONEVIEW_PUBLIC_URL`). PhoneView
-stops when ISDi stops, including when ISDi is killed. For remote use, also serve
+stops when ISDi stops, including when ISDi is killed. ISDi passes its private
+screenshots directory as `--screenshot-dir`, so screenshots outlast a PhoneView
+restart and stay with ISDi's other case data. For remote use, also serve
 that port: `tailscale serve --bg --https=8443 http://127.0.0.1:6201`.
 
 ### Running as a service (Linux)
@@ -189,9 +199,9 @@ Robustness rules the code follows:
 |---|---|
 | Network | Listens on 127.0.0.1 only; nothing is reachable from the LAN. Remote access goes through `tailscale serve` (TLS, tailnet membership, access rules). |
 | Sign-in | Per-run token (`PHONEVIEW_TOKEN`, or generated) → random session id in an HttpOnly, SameSite=Strict cookie (Secure over HTTPS). Every page and the WebSocket require it. The token is never a command-line argument, so other users can't read it from the process list. |
-| Requests | Host allow-list (blocks DNS rebinding), Origin allow-list on the WebSocket (blocks cross-site hijacking), strict CSP, no caching, one controller at a time. |
-| Accountability | Each view's start and end, with the tailnet login that `tailscale serve` adds (`Tailscale-User-Login`, which it strips from incoming requests), go to the log and to `--audit-log`. |
-| Data | No frames, keystrokes or clipboard contents are stored. |
+| Requests | Host allow-list (blocks DNS rebinding), Origin allow-list on the WebSocket and on every request that changes something (blocks cross-site requests), strict CSP, no caching, one controller at a time. |
+| Accountability | Each view's start and end, and each screenshot taken, exported or deleted (with its SHA-256), with the tailnet login that `tailscale serve` adds (`Tailscale-User-Login`, which it strips from incoming requests), go to the log and to `--audit-log`. |
+| Data | Only screenshots someone explicitly takes are kept: in memory, or with `--screenshot-dir` in an owner-only (0700) directory. No video frames, keystrokes or clipboard contents are stored. Delete screenshots when the case no longer needs them. |
 
 Not covered: anyone with an account or malware on the host machine can use the phone
 through adb or usbmuxd directly, so use a dedicated, up-to-date host.

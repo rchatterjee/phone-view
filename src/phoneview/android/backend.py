@@ -13,10 +13,12 @@ from dataclasses import dataclass, replace
 
 from phoneview.android import scrcpy
 from phoneview.android.adb import AdbClient, AdbError, AdbUnavailableError
-from phoneview.backends.base import Backend, capabilities, setting
+from phoneview.backends.base import Backend, ScreenshotUnavailable, capabilities, setting
 from phoneview.events import COORD_MAX
 
 log = logging.getLogger(__name__)
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 MAX_SIZES = (0, 1920, 1600, 1280, 1024, 800, 640)
 FPS_CHOICES = (15, 24, 30, 45, 60)
@@ -179,6 +181,20 @@ class AndroidBackend(Backend):
                 log.warning(self.error)
             self.notify()
             await asyncio.sleep(1)
+
+    async def screenshot(self):
+        """Full-resolution PNG from the phone (`screencap -p`), independent of the video stream."""
+        serial = self.serial
+        if serial is None:
+            raise ScreenshotUnavailable("No Android phone connected")
+        try:
+            data = await self.adb.exec_out(serial, "screencap -p")
+        except (AdbError, OSError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+            raise ScreenshotUnavailable(f"The phone did not return a screenshot ({type(exc).__name__})") from exc
+        if not data.startswith(PNG_SIGNATURE):
+            # e.g. a secure window (banking apps) or a locked screen policy.
+            raise ScreenshotUnavailable("The phone refused the screenshot (the app on screen may block captures).")
+        return data, "image/png"
 
     def _forget_device(self):
         if self.device is not None:

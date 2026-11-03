@@ -34,6 +34,15 @@
       <p class="hint">Or click the screen and type directly. Ctrl+V pastes.</p>
     </form>
 
+    <label class="inline">Screen size
+      <select id="view-size">
+        <option value="fit">Fit window</option>
+        <option value="100">100%</option>
+        <option value="75">75%</option>
+        <option value="50">50%</option>
+      </select>
+    </label>
+
     <p id="feedback" role="status"></p>
     <p id="metrics"></p>
     <p id="control-mode" class="hint"></p>
@@ -60,6 +69,20 @@
     </details>
 
     <button id="reconnect" hidden>Reconnect</button>
+  </aside>
+
+  <aside id="shots" aria-label="Screenshots">
+    <div class="shots-head">
+      <h2>Screenshots <span id="shot-count"></span></h2>
+      <button id="shot-take" class="primary" title="Capture the phone's screen at full resolution">Take screenshot</button>
+    </div>
+    <div class="buttons">
+      <a id="shot-pdf" class="button" href="/api/screenshots.pdf" download aria-disabled="true">Download all as PDF</a>
+      <button id="shot-clear" disabled>Delete all</button>
+    </div>
+    <p id="shot-feedback" class="hint" role="status"></p>
+    <p id="shot-empty" class="hint">No screenshots yet. They are listed here in the order they will appear in the PDF; drag them, or use the arrows, to reorder.</p>
+    <ol id="shot-list"></ol>
   </aside>
 </main>
 </body>

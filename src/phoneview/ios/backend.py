@@ -20,7 +20,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
-from phoneview.backends.base import Backend, capabilities, setting
+from phoneview.backends.base import Backend, ScreenshotUnavailable, capabilities, setting
 from phoneview.ios.connection import TunnelSetupError, open_device
 from phoneview.ios.developer_mode import DeveloperModeMonitor
 from phoneview.streaming import encode_frame
@@ -34,6 +34,21 @@ SETTING_NAMES = ("short_edge", "jpeg_quality", "active_fps", "idle_fps", "bandwi
 
 class StreamDropped(RuntimeError):
     """The live stream worked and then failed: reconnect, don't give up on it."""
+
+
+class ReconnectNow(RuntimeError):
+    """Not an error: start a new device session right away (e.g. after mounting the DDI)."""
+
+
+DISPLAY_SERVICE = "com.apple.coredevice.displayservice"
+
+
+def offered_services(rsd):
+    """Service names from the RSD handshake (empty if unknown)."""
+    try:
+        return set((rsd.peer_info or {}).get("Services") or {})
+    except Exception:
+        return set()
 
 
 class SetupNeeded(RuntimeError):
@@ -73,6 +88,18 @@ class IOSSettings:
             raise ValueError("Choose --tunnel or --rsd, not both")
 
 
+def as_png(data):
+    """Screenshot services return PNG (or TIFF on some versions); store PNG."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return data
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as im:
+        out = io.BytesIO()
+        im.save(out, "PNG")
+        return out.getvalue()
+
+
 def ios_major(version):
     head = str(version or "").split(".", 1)[0]
     return int(head) if head.isdigit() else None
@@ -109,6 +136,9 @@ class IOSBackend(Backend):
         self._counts = [0, 0]
         self._rates = [0.0, 0.0]
         self._window = time.monotonic()
+        self._rsd = None              # iOS 17+ RemoteServiceDiscovery while connected
+        self._capturing = False       # _capture_loop is running
+        self._raw_waiters = []        # futures for the next full-resolution capture
 
     # -- capabilities / status -------------------------------------------------
 
@@ -226,6 +256,10 @@ class IOSBackend(Backend):
                     self._session_task.cancel()
                     raise
                 self.error = None
+            except ReconnectNow as exc:
+                log.info("%s; reconnecting", exc)
+                self.error = None
+                self._retry.set()
             except SetupNeeded as exc:
                 self._set_error(str(exc))
             except TunnelSetupError as exc:
@@ -306,30 +340,46 @@ class IOSBackend(Backend):
         return mode
 
     async def _coredevice(self):
-        from phoneview.ios.stream import StreamUnavailable, stream_supported
         s = self.settings
         async with open_device(self.udid, tunnel=s.tunnel, rsd_address=s.rsd_address, on_device=self._inspect) as rsd:
-            self.generation += 1
-            want_stream = s.video_mode != "screenshot" and self.udid not in self._stream_failed
-            if want_stream and stream_supported(rsd.product_version):
-                try:
-                    await self._run_stream(rsd)
-                except (asyncio.CancelledError, StreamDropped):
+            self._rsd = rsd
+            try:
+                await self._coredevice_session(rsd)
+            finally:
+                self._rsd = None
+
+    async def _coredevice_session(self, rsd):
+        from phoneview.ios.stream import StreamUnavailable, stream_supported
+        s = self.settings
+        if await self._ensure_ddi(rsd):
+            # The RSD handshake listed the services before the mount; reconnect to see the new ones.
+            raise ReconnectNow("Developer Disk Image mounted")
+        self.generation += 1
+        want_stream = s.video_mode != "screenshot" and self.udid not in self._stream_failed
+        services = offered_services(rsd)
+        if want_stream and services and DISPLAY_SERVICE not in services:
+            self._stream_failed[self.udid] = "This iPhone does not offer the live screen stream; using screenshots."
+            want_stream = False
+            log.warning("%s (no %s)", self._stream_failed[self.udid], DISPLAY_SERVICE)
+        if want_stream and stream_supported(rsd.product_version):
+            try:
+                await self._run_stream(rsd)
+            except (asyncio.CancelledError, StreamDropped):
+                raise
+            except Exception as exc:
+                if s.video_mode == "stream":
                     raise
-                except Exception as exc:
-                    if s.video_mode == "stream":
-                        raise
-                    reason = str(exc) if isinstance(exc, StreamUnavailable) else type(exc).__name__
-                    self._stream_failed[self.udid] = reason
-                    self.note = f"Screen stream unavailable ({reason}); using screenshots."
-                    log.warning(self.note)
-                    self.hub.clear()
-            elif want_stream:
-                self.note = (f"Live video streaming needs iOS 27 or later (this iPhone runs "
-                             f"{rsd.product_version}); using screenshots.")
-            if self.udid in self._stream_failed and self.note is None:
-                self.note = self._stream_failed[self.udid]
-            await self._screenshot_mode(rsd)
+                reason = str(exc) if isinstance(exc, StreamUnavailable) else type(exc).__name__
+                self._stream_failed[self.udid] = reason
+                self.note = f"Screen stream unavailable ({reason}); using screenshots."
+                log.warning(self.note)
+                self.hub.clear()
+        elif want_stream:
+            self.note = (f"Live video streaming needs iOS 27 or later (this iPhone runs "
+                         f"{rsd.product_version}); using screenshots.")
+        if self.udid in self._stream_failed and self.note is None:
+            self.note = self._stream_failed[self.udid]
+        await self._screenshot_mode(rsd)
 
     async def _run_stream(self, rsd):
         from phoneview.ios.stream import CoreDeviceStream, StreamUnavailable
@@ -397,11 +447,19 @@ class IOSBackend(Backend):
     # -- iOS 15-16 -------------------------------------------------------------------
 
     async def _ensure_ddi(self, lockdown):
+        """Mount the Developer Disk Image if needed; True if it was mounted just now.
+
+        iOS 15-16 use the shared "Developer" image (over lockdown). iOS 17+ use a
+        "Personalized" image, which provides the CoreDevice developer services
+        (display stream, HID, screenshots); from iOS 27 it can only be installed
+        over the RSD tunnel, so pass the RSD there.
+        """
         from pymobiledevice3.exceptions import AlreadyMountedError
         from pymobiledevice3.services.mobile_image_mounter import MobileImageMounterService, auto_mount
+        kind = "Personalized" if (self.major or 0) >= 17 else "Developer"
         async with MobileImageMounterService(lockdown=lockdown) as mounter:
-            if await mounter.is_image_mounted("Developer"):
-                return
+            if await mounter.is_image_mounted(kind):
+                return False
         if not self.settings.auto_mount_ddi:
             raise SetupNeeded("The Developer Disk Image is not mounted. Restart PhoneView without "
                               "--no-auto-mount, or mount it with 'pymobiledevice3 mounter auto-mount'.")
@@ -410,12 +468,16 @@ class IOSBackend(Backend):
         try:
             await asyncio.wait_for(auto_mount(lockdown), 180)
         except AlreadyMountedError:
-            pass
+            self.note = None
+            return False
         except Exception as exc:
+            log.warning("Developer Disk Image mount failed: %s: %s", type(exc).__name__, exc)
             raise SetupNeeded(f"Could not mount the Developer Disk Image ({type(exc).__name__}). "
                               "Keep the iPhone unlocked with Developer Mode on, check the internet "
                               "connection for the first download, then retry.") from exc
         self.note = None
+        log.info("Mounted the %s Developer Disk Image", kind)
+        return True
 
     async def _legacy(self, lockdown):
         await self._ensure_ddi(lockdown)
@@ -568,12 +630,28 @@ class IOSBackend(Backend):
         """Poll screenshots at active/idle fps; encode changed ones off the event loop."""
         previous = None
         last_capture = 0.0
+        self._capturing = True
+        try:
+            await self._capture_frames(grab, stop, previous, last_capture)
+        finally:
+            self._capturing = False
+            for waiter in self._raw_waiters:
+                if not waiter.done():
+                    waiter.set_exception(ScreenshotUnavailable("The iPhone connection was interrupted"))
+            self._raw_waiters.clear()
+
+    async def _capture_frames(self, grab, stop, previous, last_capture):
         while stop is None or not stop():
-            await self._sleep(last_capture + 1 / self.settings.active_fps - time.monotonic())
+            if not self._raw_waiters:
+                await self._sleep(last_capture + 1 / self.settings.active_fps - time.monotonic())
             probe = not self.viewer
             revision = self.stream_revision
             start = last_capture = time.monotonic()
             image = await asyncio.wait_for(grab(), 5)
+            waiters, self._raw_waiters = self._raw_waiters, []
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(bytes(image))
             self.capture_ms = (time.monotonic() - start) * 1000
             self._counts[0] += 1
             self.capture_ready = True
@@ -596,7 +674,33 @@ class IOSBackend(Backend):
             del image
             fps = self.settings.active_fps if time.monotonic() < self.active_until else self.settings.idle_fps
             # Without a viewer, one probe every five seconds detects unplugging.
-            await self._sleep(max(0, 1 / fps - (time.monotonic() - start)) if self.viewer else 5)
+            if not self._raw_waiters:     # a screenshot was requested: capture again now
+                await self._sleep(max(0, 1 / fps - (time.monotonic() - start)) if self.viewer else 5)
+
+    # -- screenshots ---------------------------------------------------------------
+
+    async def screenshot(self):
+        """Full-resolution capture from the iPhone, as PNG."""
+        if self.mode == "stream" and self._rsd is not None:
+            # The live stream is video; ask the screenshot service for one image.
+            from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+            from pymobiledevice3.services.dvt.instruments.screenshot import Screenshot
+            try:
+                async with DvtProvider(self._rsd) as dvt, Screenshot(dvt) as service:
+                    raw = await asyncio.wait_for(service.get_screenshot(), 10)
+            except Exception as exc:
+                raise ScreenshotUnavailable(f"The iPhone did not return a screenshot ({type(exc).__name__})") from exc
+        elif self._capturing:
+            waiter = asyncio.get_running_loop().create_future()
+            self._raw_waiters.append(waiter)
+            self._wake.set()                 # capture now instead of at the next frame time
+            try:
+                raw = await asyncio.wait_for(waiter, 10)
+            except asyncio.TimeoutError as exc:
+                raise ScreenshotUnavailable("The iPhone did not return a screenshot in time") from exc
+        else:
+            return await super().screenshot()   # e.g. WebDriverAgent MJPEG frames
+        return await asyncio.to_thread(as_png, raw), "image/png"
 
     # -- input -------------------------------------------------------------------
 

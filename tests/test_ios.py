@@ -164,6 +164,111 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                                          ("/touch", {"type": "release", "x": 3, "y": 4}),
                                          ("/button", {"name": "volume-up", "state": "press"})])
 
+    async def test_size_change_without_reset_reconfigures_viewer(self):
+        """Seen on iOS 27: the stream starts at 1280x720 and switches to 1184x2576 with a new
+        SPS on a plain key frame; the browser kept the old size and showed only the top."""
+        def nal(kind, body):
+            data = bytes([kind << 1, 1]) + body
+            return len(data).to_bytes(4, "big") + data
+        sps_small, sps_tall = nal(33, b"1280x720"), nal(33, b"1184x2576")
+        vps, pps, idr = nal(32, b"v"), nal(34, b"p"), nal(19, b"picture")
+        key_small = vps + sps_small + pps + idr
+        key_tall = vps + sps_tall + pps + idr
+
+        sidecar = FakeSidecar([(0, key_small), (1, nal(1, b"delta")), (0, key_small), (0, key_tall),
+                               (1, nal(1, b"d2"))])
+        sidecar.description = sps_small[4:]
+
+        async def handle(reader, writer):
+            peek = await reader.readuntil(b"\r\n\r\n")
+            if peek.startswith(b"GET /codec"):
+                if seen_tall[0]:
+                    sidecar.description = sps_tall[4:]
+                data = json.dumps({"codec": "hev1.1.6.L150.B0",
+                                   "description": base64.b64encode(b"hvcC" + sidecar.description).decode()}).encode()
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(data) + data)
+            else:
+                writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                for t, d in sidecar.frames:
+                    if d is key_tall:
+                        seen_tall[0] = True      # the server has parsed the new SPS by now
+                    piece = (len(d) + 1).to_bytes(4, "big") + bytes([t]) + d
+                    writer.write(b"%x\r\n" % len(piece) + piece + b"\r\n")
+                writer.write(b"0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+        seen_tall = [False]
+        sidecar.handle = handle
+        await sidecar.start()
+
+        hub = MediaHub()
+        sub = hub.subscribe()
+        stream = stream_module.CoreDeviceStream(rsd=None, hub=hub)
+        stream.port = sidecar.port
+        items = []
+
+        async def consume():
+            while True:
+                items.append(await sub.next())
+        consumer = asyncio.create_task(consume())
+        await stream._pump(asyncio.Event())
+        await asyncio.sleep(0.05)
+        consumer.cancel()
+        order = [i[0] if i[0] == "config" else ("key" if i[1] else "delta") for i in items]
+        # Configured once at start, then again right before the first tall key frame only.
+        self.assertEqual(order, ["config", "key", "delta", "key", "config", "key", "delta"])
+        configs = [i[1] for i in items if i[0] == "config"]
+        self.assertIn(base64.b64encode(b"hvcC" + sps_tall[4:]).decode(), configs[1]["description"])
+        self.assertEqual(stream_module.sps_of(key_tall), sps_tall[4:])
+        self.assertIsNone(stream_module.sps_of(b"KEY"))     # malformed data is ignored
+
+    def test_picture_size_from_hvcc(self):
+        """The size Chrome needs (codedWidth/codedHeight), read from the stream's SPS."""
+        def sps(width, height, crop=None):
+            bits = []
+            def u(value, n):
+                bits.extend((value >> (n - 1 - i)) & 1 for i in range(n))
+            def ue(value):
+                value += 1
+                n = value.bit_length()
+                u(0, n - 1)
+                u(value, n)
+            u(0, 4); u(0, 3); u(1, 1)                 # vps id, max_sub_layers_minus1=0, nesting
+            u(0x01, 8); u(0x60000000, 32); u(0, 48); u(150, 8)   # Main profile, level 5.0
+            ue(0); ue(1)                               # sps id, chroma 4:2:0
+            ue(width); ue(height)
+            if crop:
+                u(1, 1); [ue(c) for c in crop]
+            else:
+                u(0, 1)
+            u(1, 1)                                    # stop bit (anything after is ignored)
+            bits.extend([0] * (-len(bits) % 8))
+            raw = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+            out, zeros = bytearray(), 0                # add emulation prevention like an encoder
+            for b in raw:
+                if zeros >= 2 and b <= 3:
+                    out.append(3)
+                    zeros = 0
+                out.append(b)
+                zeros = zeros + 1 if b == 0 else 0
+            return bytes([33 << 1, 1]) + bytes(out)
+
+        def hvcc(nal):
+            return bytes(22) + bytes([1, 0x80 | 33]) + (1).to_bytes(2, "big") + len(nal).to_bytes(2, "big") + nal
+
+        self.assertEqual(stream_module.hvcc_size(hvcc(sps(1184, 2576))), (1184, 2576, 1184, 2576))
+        # A conformance window trims the visible picture (offsets are in chroma units for 4:2:0).
+        self.assertEqual(stream_module.hvcc_size(hvcc(sps(1184, 2592, crop=(0, 0, 0, 8)))), (1184, 2592, 1184, 2576))
+        self.assertIsNone(stream_module.hvcc_size(b"hvcc"))
+        self.assertIsNone(stream_module.hvcc_size(hvcc(sps(1184, 2576))[:30]))
+
+        hub = MediaHub()
+        stream = stream_module.CoreDeviceStream(rsd=None, hub=hub)
+        stream._set_config({"codec": "hev1.1.6.L150.B0",
+                            "description": base64.b64encode(hvcc(sps(1184, 2576))).decode()})
+        self.assertEqual((hub.config["width"], hub.config["height"],
+                          hub.config["coded_width"], hub.config["coded_height"]), (1184, 2576, 1184, 2576))
+
     async def test_viewer_leaving_lifts_stream_finger(self):
         sidecar = await FakeSidecar([]).start()
         backend = IOSBackend()
@@ -281,6 +386,90 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((item[2], item[3]), (480, 854))
         sub.ack()
         self.assertIsNone(await sub.next(0))       # duplicates suppressed
+        await backend.close()
+
+
+class FakeRsd:
+    product_version = "27.0.1"
+
+    def __init__(self, services):
+        self.peer_info = {"Services": {name: {"Port": "1"} for name in services}}
+
+
+class CoreDeviceSessionTests(unittest.IsolatedAsyncioTestCase):
+    """iOS 17+: the personalized DDI provides the CoreDevice services (seen on an iPhone 13, iOS 27.0.1)."""
+
+    def backend(self, mounted_now):
+        from phoneview.ios import backend as backend_module
+        backend = IOSBackend()
+        backend.udid, backend.major = "00008110-x", 27
+        calls = []
+
+        async def ensure_ddi(provider):
+            calls.append(provider)
+            return mounted_now
+        backend._ensure_ddi = ensure_ddi
+        backend.calls = calls
+        backend.module = backend_module
+        return backend
+
+    async def test_mounts_over_rsd_then_reconnects(self):
+        backend = self.backend(mounted_now=True)
+        rsd = FakeRsd([])
+        with self.assertRaises(backend.module.ReconnectNow):
+            await backend._coredevice_session(rsd)
+        self.assertEqual(backend.calls, [rsd])          # mounted over the RSD tunnel, not lockdown
+
+    async def test_missing_display_service_goes_straight_to_screenshots(self):
+        backend = self.backend(mounted_now=False)
+        modes = []
+
+        async def run_stream(rsd):
+            raise AssertionError("must not wait 45 s for a service the phone does not offer")
+
+        async def screenshot_mode(rsd):
+            modes.append("screenshot")
+        backend._run_stream, backend._screenshot_mode = run_stream, screenshot_mode
+        await backend._coredevice_session(FakeRsd(["com.apple.coredevice.hid.universalhidservice"]))
+        self.assertEqual(modes, ["screenshot"])
+        self.assertIn("does not offer the live screen stream", backend._stream_failed["00008110-x"])
+        backend.mode = "screenshot"                     # what _screenshot_mode sets
+        self.assertIn("retry_stream", backend.capabilities()["setup"])
+
+    async def test_offered_display_service_starts_stream(self):
+        backend = self.backend(mounted_now=False)
+        started = []
+
+        async def run_stream(rsd):
+            started.append(rsd)
+        async def screenshot_mode(rsd):
+            pass
+        backend._run_stream, backend._screenshot_mode = run_stream, screenshot_mode
+        rsd = FakeRsd(["com.apple.coredevice.displayservice"])
+        await backend._coredevice_session(rsd)
+        self.assertEqual(started, [rsd])
+
+    async def test_screenshot_takes_next_full_resolution_capture(self):
+        from io import BytesIO
+        from PIL import Image
+        png = BytesIO()
+        Image.new("RGB", (1170, 2532), "blue").save(png, format="PNG")
+        backend = IOSBackend(IOSSettings(active_fps=1, idle_fps=0.5))
+        await backend.set_viewer(True)
+        grabs = 0
+
+        async def grab():
+            nonlocal grabs
+            grabs += 1
+            return png.getvalue()
+
+        task = asyncio.create_task(backend._capture_loop(grab))
+        await asyncio.sleep(0.05)
+        data, mime = await asyncio.wait_for(backend.screenshot(), 3)
+        self.assertEqual((mime, data[:4]), ("image/png", b"\x89PNG"))
+        self.assertEqual(Image.open(BytesIO(data)).size, (1170, 2532))   # not the 480-px stream frame
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await backend.close()
 
 

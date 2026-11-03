@@ -143,6 +143,22 @@ class AdbClient:
         finally:
             self._close(writer)
 
+    async def exec_out(self, serial, command, timeout=20, limit=64 << 20):
+        """Binary-safe output of `command` (the `exec:` service, like `adb exec-out`)."""
+        reader, writer = await self.open_stream(serial, f"exec:{command}")
+        try:
+            chunks, size = [], 0
+            while True:
+                data = await asyncio.wait_for(reader.read(1 << 20), timeout)
+                if not data:
+                    return b"".join(chunks)
+                size += len(data)
+                if size > limit:
+                    raise AdbError(f"`{command}` produced more than {limit} bytes")
+                chunks.append(data)
+        finally:
+            self._close(writer)
+
     async def getprops(self, serial, names):
         out = {}
         for name in names:

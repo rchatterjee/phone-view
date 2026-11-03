@@ -48,3 +48,29 @@ assert.equal(single.claim(1, true, false), 0);
 assert.equal(single.claim(2, false, false), null);
 
 console.log('viewer.js helper tests passed');
+
+// Screenshot reordering.
+assert.deepEqual(v.reorderIds(['a', 'b', 'c', 'd'], 'd', 'b', false), ['a', 'd', 'b', 'c']);
+assert.deepEqual(v.reorderIds(['a', 'b', 'c', 'd'], 'a', 'c', true), ['b', 'c', 'a', 'd']);
+assert.deepEqual(v.reorderIds(['a', 'b'], 'a', 'a', true), ['a', 'b']);
+assert.deepEqual(v.reorderIds(['a', 'b'], 'x', 'a', true), ['a', 'b']);
+assert.deepEqual(v.stepIds(['a', 'b', 'c'], 'b', -1), ['b', 'a', 'c']);
+assert.deepEqual(v.stepIds(['a', 'b', 'c'], 'c', 1), ['a', 'b', 'c']);
+console.log('screenshot order tests passed');
+
+// Decoder size: the real picture size goes to WebCodecs, and frames reporting less are corrected.
+const tall = {codec_string: 'hev1.1.6.L150.B0', format: 'hvcc', description: 'AAEC',
+              width: 1184, height: 2576, coded_width: 1184, coded_height: 2576};
+const conf = v.decoderConfig(tall);
+assert.equal(conf.codedWidth, 1184); assert.equal(conf.codedHeight, 2576);
+assert.equal(conf.displayAspectWidth, 1184); assert.equal(conf.displayAspectHeight, 2576);
+assert.equal(v.decoderConfig({codec_string: 'x', format: 'annexb', width: 0, height: 0}).codedWidth, undefined);
+const frame = (dw, dh, cw, ch) => ({displayWidth: dw, displayHeight: dh, codedWidth: cw, codedHeight: ch});
+assert.deepEqual(v.visibleFix(frame(1280, 720, 1184, 2576), tall), {x: 0, y: 0, width: 1184, height: 2576});
+assert.equal(v.visibleFix(frame(1184, 2576, 1184, 2576), tall), null);    // already right
+assert.equal(v.visibleFix(frame(1280, 720, 1280, 720), tall), null);      // cannot read outside the decoded picture
+assert.equal(v.visibleFix(frame(1280, 720, 1184, 2576), {width: 0, height: 0}), null);
+assert.equal(v.viewWidth('fit', 1184), null);
+assert.equal(v.viewWidth('50', 1184), 592);
+assert.equal(v.viewWidth('100', 0), null);
+console.log('decoder size tests passed');

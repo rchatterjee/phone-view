@@ -9,7 +9,7 @@ import asyncio
 import contextlib
 import logging
 
-from phoneview.backends.base import Backend, capabilities
+from phoneview.backends.base import Backend, ScreenshotUnavailable, capabilities
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +92,11 @@ class AutoBackend(Backend):
         if self.current is None:
             raise ValueError("No phone connected")
         return await self.current.setup_action(name)
+
+    async def screenshot(self):
+        if self.current is None:
+            raise ScreenshotUnavailable("No phone connected")
+        return await self.current.screenshot()
 
     async def set_viewer(self, present):
         await super().set_viewer(present)

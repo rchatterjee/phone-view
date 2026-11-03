@@ -9,6 +9,10 @@ import asyncio
 from phoneview.media import MediaHub
 
 
+class ScreenshotUnavailable(RuntimeError):
+    """A screenshot cannot be taken right now; the message is shown to the user."""
+
+
 def capabilities(*, video=None, touch=False, multitouch=False, live_touch=False, keys=(),
                  text=False, scroll=False, commands=(), clipboard=False, setup=(), settings=()):
     """Describe what the current device connection supports.
@@ -77,6 +81,16 @@ class Backend:
 
     async def close(self):
         pass
+
+    async def screenshot(self):
+        """The phone's screen as (image bytes, mime type), at the best resolution available.
+
+        Backends override this with a full-resolution capture from the device. The
+        default is the newest frame sent to the browser, when it is a JPEG.
+        """
+        if self.hub.latest_jpeg is not None:
+            return bytes(self.hub.latest_jpeg[0]), "image/jpeg"
+        raise ScreenshotUnavailable("No screen image is available yet.")
 
     # -- shared helpers ---------------------------------------------------------
 

@@ -44,6 +44,98 @@ def stream_supported(product_version):
         return False
 
 
+HEVC_NAL_SPS = 33
+
+
+def sps_of(access_unit):
+    """The SPS NAL in a 4-byte-length-prefixed HEVC access unit, or None."""
+    i, n = 0, len(access_unit)
+    while i + 4 <= n:
+        size = int.from_bytes(access_unit[i:i + 4], "big")
+        start, i = i + 4, i + 4 + size
+        if size < 2 or i > n:
+            return None
+        if (access_unit[start] >> 1) & 0x3F == HEVC_NAL_SPS:
+            return bytes(access_unit[start:i])
+    return None
+
+
+class _Bits:
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def u(self, n):
+        value = 0
+        for _ in range(n):
+            byte = self.data[self.pos >> 3]          # IndexError on truncated data
+            value = (value << 1) | ((byte >> (7 - (self.pos & 7))) & 1)
+            self.pos += 1
+        return value
+
+    def ue(self):
+        zeros = 0
+        while self.u(1) == 0:
+            zeros += 1
+            if zeros > 31:
+                raise ValueError("bad exp-Golomb code")
+        return (1 << zeros) - 1 + self.u(zeros)
+
+
+def sps_size(sps):
+    """(coded_w, coded_h, visible_w, visible_h) from an HEVC SPS NAL unit (with its 2-byte header)."""
+    rbsp, zeros = bytearray(), 0
+    for byte in sps[2:]:                              # drop emulation-prevention bytes
+        if zeros >= 2 and byte == 3:
+            zeros = 0
+            continue
+        rbsp.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    r = _Bits(bytes(rbsp))
+    r.u(4)                                            # sps_video_parameter_set_id
+    max_sub_layers = r.u(3)
+    r.u(1)
+    r.u(88)                                           # general profile space/tier/idc, flags
+    r.u(8)                                            # general_level_idc
+    present = [(r.u(1), r.u(1)) for _ in range(max_sub_layers)]
+    if max_sub_layers:
+        r.u(2 * (8 - max_sub_layers))
+    for profile, level in present:
+        if profile:
+            r.u(88)
+        if level:
+            r.u(8)
+    r.ue()                                            # sps_seq_parameter_set_id
+    chroma = r.ue()
+    if chroma == 3:
+        r.u(1)
+    width, height = r.ue(), r.ue()
+    left = right = top = bottom = 0
+    if r.u(1):                                        # conformance_window_flag
+        left, right, top, bottom = r.ue(), r.ue(), r.ue(), r.ue()
+    sub_w = 2 if chroma in (1, 2) else 1
+    sub_h = 2 if chroma == 1 else 1
+    return width, height, width - sub_w * (left + right), height - sub_h * (top + bottom)
+
+
+def hvcc_size(description):
+    """Picture size from the SPS in an hvcC record, or None if it cannot be read."""
+    try:
+        i, arrays = 23, description[22]
+        for _ in range(arrays):
+            nal_type = description[i] & 0x3F
+            count = int.from_bytes(description[i + 1:i + 3], "big")
+            i += 3
+            for _ in range(count):
+                length = int.from_bytes(description[i:i + 2], "big")
+                nal = description[i + 2:i + 2 + length]
+                i += 2 + length
+                if nal_type == HEVC_NAL_SPS:
+                    return sps_size(nal)
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -72,6 +164,8 @@ class CoreDeviceStream:
         self.port = free_port()
         self.server = None
         self.codec = None
+        self.description = b""        # hvcC record the browser's decoder is configured with
+        self._config_checked = 0.0
         self.input_queue = asyncio.Queue(256)
         self.touching = False
         self.last_point = (32768, 32768)
@@ -97,11 +191,28 @@ class CoreDeviceStream:
         raise StreamUnavailable("The device did not start its screen stream in time.")
 
     def _set_config(self, codec, force=False):
-        base64.b64decode(codec["description"], validate=True)
+        self.description = base64.b64decode(codec["description"], validate=True)
         self.codec = codec
+        # The picture size goes to the browser too: Chrome's HEVC decoder on Windows,
+        # configured without codedWidth/codedHeight, reported 1280x720 frames for this
+        # 1184x2576 stream and showed only the top of the screen.
+        coded_w, coded_h, width, height = hvcc_size(self.description) or (0, 0, 0, 0)
         self.hub.set_config({"codec": "hevc", "codec_string": codec["codec"],
-                             "description": codec["description"], "width": 0, "height": 0,
+                             "description": codec["description"], "width": width, "height": height,
+                             "coded_width": coded_w, "coded_height": coded_h,
                              "format": "hvcc"}, force=force)
+
+    def _sps_changed(self, access_unit):
+        """True if this key frame carries an SPS the browser's decoder was not given."""
+        sps = sps_of(access_unit)
+        if sps is None or not self.description or sps in self.description:
+            return False
+        now = time.monotonic()
+        if now - self._config_checked < 1.0:     # the refetch lags: don't loop on it
+            return False
+        self._config_checked = now
+        log.info("iPhone stream parameters changed; reconfiguring the viewer")
+        return True
 
     def request_keyframe(self):
         request = getattr(self.server, "_request_recovery_idr", None)
@@ -158,9 +269,11 @@ class CoreDeviceStream:
                     kind = buffer[4]
                     data = bytes(buffer[5:4 + length])
                     del buffer[:4 + length]
-                    if kind == 2:
-                        # Decoder reset requested; parameter sets may have changed.
-                        # Keep the previous ones if the refetch is slow.
+                    if kind == 2 or (kind == 0 and self._sps_changed(data)):
+                        # Decoder reset requested, or the phone changed its picture size
+                        # (it can start at 1280x720 and switch to the portrait screen size
+                        # without a reset): send the new parameter sets so the browser
+                        # reconfigures before this key frame. Keep the old ones if slow.
                         with contextlib.suppress(StreamUnavailable):
                             self._set_config(await self._fetch_codec(time.monotonic() + 5), force=True)
                     self.frames += 1
