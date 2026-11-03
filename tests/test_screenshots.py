@@ -52,21 +52,37 @@ class StoreTests(unittest.TestCase):
             store.image(a["id"])
         self.assertTrue(store.thumbnail(b["id"]).startswith(b"\xff\xd8"))
 
-    def test_persists_owner_only(self):
+    def test_files_are_owner_only_temporary_and_wiped(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = os.path.join(tmp, "shots")
             store = ScreenshotStore(folder)
-            a = store.add(png(), "image/png", DEVICE)
-            b = store.add(png(color="#fed"), "image/png", DEVICE)
-            store.set_caption(b["id"], "second")
-            store.reorder([b["id"], a["id"]])
-            self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
-            for name in os.listdir(folder):
-                self.assertEqual(stat.S_IMODE(os.stat(os.path.join(folder, name)).st_mode), 0o600, name)
+            store.add(png(), "image/png", DEVICE)
+            store.add(png(color="#fed"), "image/png", DEVICE)
+            if os.name != "nt":           # Windows has no Unix permission bits
+                self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
+                for name in os.listdir(folder):
+                    self.assertEqual(stat.S_IMODE(os.stat(os.path.join(folder, name)).st_mode), 0o600, name)
+            # A run that crashed leaves files behind; the next run deletes them.
             again = ScreenshotStore(folder)
-            self.assertEqual([(r["id"], r["caption"]) for r in again.list()], [(b["id"], "second"), (a["id"], "")])
-            again.clear()
-            self.assertEqual(sorted(os.listdir(folder)), ["index.json"])
+            self.assertEqual(again.list(), [])
+            self.assertEqual(os.listdir(folder), [])
+            # wipe() deletes everything it made, and the folder once it is empty...
+            again.add(png(), "image/png", DEVICE)
+            self.assertEqual(again.wipe(), 1)
+            self.assertFalse(os.path.exists(folder))
+            # ...but never files it did not make.
+            third = ScreenshotStore(folder)
+            third.add(png(), "image/png", DEVICE)
+            open(os.path.join(folder, "notes.txt"), "w").close()
+            third.wipe()
+            self.assertEqual(os.listdir(folder), ["notes.txt"])
+
+    def test_wipe_in_memory(self):
+        store = ScreenshotStore()
+        sid = store.add(png(), "image/png", DEVICE)["id"]
+        store.thumbnail(sid)
+        self.assertEqual(store.wipe(), 1)
+        self.assertEqual((store.list(), store._memory, store._thumbs), ([], {}, {}))
 
     def test_rejects_non_images_and_unknown_types(self):
         store = ScreenshotStore()
@@ -128,6 +144,10 @@ class ApiTests(unittest.TestCase):
         server.SHOT_INTERVAL = 0
         self.addCleanup(setattr, server, "SHOT_INTERVAL", self._interval)
 
+    def events(self):
+        with open(self.audit_file.name, encoding="utf-8") as fh:
+            return [json.loads(line)["event"] for line in fh]
+
     def take(self):
         r = self.client.post("/api/screenshots", headers=self.origin)
         self.assertEqual(r.status_code, 200, r.text)
@@ -167,7 +187,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/screenshots/{a['id']}").status_code, 404)
         self.assertEqual(self.client.delete("/api/screenshots", headers=self.origin).json(), {"items": []})
 
-        events = [json.loads(line)["event"] for line in open(self.audit_file.name)]
+        events = self.events()
         self.assertEqual(events, ["screenshot", "screenshot", "screenshots_exported",
                                   "screenshot_deleted", "screenshots_deleted"])
 
@@ -200,6 +220,63 @@ class ApiTests(unittest.TestCase):
         self.take()
         r = self.client.post("/api/screenshots", headers=self.origin)
         self.assertEqual(r.status_code, 429)
+
+
+class StopWhenClosedTests(unittest.TestCase):
+    """When the PhoneView page is closed, PhoneView stops and its screenshots are deleted."""
+
+    def make(self, grace):
+        self.stopped = []
+        self.store = ScreenshotStore()
+        self.audit_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+        self.audit_file.close()
+        self.addCleanup(os.unlink, self.audit_file.name)
+        app = create_app(ShotBackend(), Access(TOKEN, 8000), AuditLog(self.audit_file.name), self.store,
+                         on_viewers_gone=lambda: self.stopped.append(True), grace=grace)
+        client = TestClient(app, base_url="http://127.0.0.1:8000", client=("127.0.0.1", 7), follow_redirects=False)
+        return client
+
+    def events(self):
+        with open(self.audit_file.name, encoding="utf-8") as fh:
+            return [json.loads(line)["event"] for line in fh]
+
+    def view(self, client):
+        from test_server import receive_until
+        with client.websocket_connect("ws://127.0.0.1:8000/ws", headers={"origin": "http://127.0.0.1:8000"}) as ws:
+            receive_until(ws, lambda m: isinstance(m, dict) and m.get("type") == "status")
+
+    def test_closing_the_page_stops_and_shutdown_wipes(self):
+        import time
+        with self.make(grace=0.2) as client:
+            client.get(f"/?token={TOKEN}")
+            import phoneview.server as server
+            interval, server.SHOT_INTERVAL = server.SHOT_INTERVAL, 0
+            self.addCleanup(setattr, server, "SHOT_INTERVAL", interval)
+            self.assertEqual(client.post("/api/screenshots", headers={"origin": "http://127.0.0.1:8000"}).status_code, 200)
+            self.view(client)
+            self.assertEqual(self.stopped, [])          # not at once: the grace period runs first
+            for _ in range(50):
+                if self.stopped:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(self.stopped, [True])
+            self.assertEqual(len(self.store.items), 1)   # still there until PhoneView actually stops
+        # Leaving the TestClient runs the shutdown path.
+        self.assertEqual(self.store.items, [])
+        events = self.events()
+        self.assertEqual(events[-2:], ["stopping", "screenshots_wiped"])
+
+    def test_reload_within_grace_keeps_running(self):
+        import time
+        with self.make(grace=0.5) as client:
+            client.get(f"/?token={TOKEN}")
+            self.view(client)
+            time.sleep(0.1)
+            self.view(client)          # reload: a new connection before the grace period ends
+            time.sleep(0.25)
+            self.assertEqual(self.stopped, [])
+            time.sleep(0.6)
+            self.assertEqual(self.stopped, [True])
 
 
 if __name__ == "__main__":

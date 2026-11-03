@@ -33,9 +33,13 @@ STATIC_FILES = {"viewer.js": "text/javascript", "viewer.css": "text/css"}
 SHOT_INTERVAL = 0.7      # seconds between screenshots (a double click takes one)
 
 
-def create_app(backend, access, audit=None, screenshots=None):
+def create_app(backend, access, audit=None, screenshots=None, on_viewers_gone=None, grace=30.0):
+    """on_viewers_gone: called when the last browser has been gone for `grace` seconds
+    (PhoneView then stops; see --stop-when-closed). A reload or a short network drop
+    reconnects within the grace period and keeps the session and its screenshots."""
     audit = audit or AuditLog()
     shots = screenshots if screenshots is not None else ScreenshotStore()
+    gone_timer = {"task": None}
 
     @asynccontextmanager
     async def lifespan(app):
@@ -43,12 +47,36 @@ def create_app(backend, access, audit=None, screenshots=None):
         try:
             yield
         finally:
+            if gone_timer["task"] is not None:
+                gone_timer["task"].cancel()
             task.cancel()
             try:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             finally:
                 await backend.close()
+                # Screenshots are temporary: nothing about the phone outlives PhoneView.
+                count = shots.wipe()
+                if count:
+                    audit.write("screenshots_wiped", count=count)
+
+    def viewer_joined():
+        if gone_timer["task"] is not None:
+            gone_timer["task"].cancel()
+            gone_timer["task"] = None
+
+    def viewer_left():
+        if on_viewers_gone is None:
+            return
+
+        async def later():
+            await asyncio.sleep(grace)
+            if app.state.controller is None:
+                logging.getLogger(__name__).info("The PhoneView page was closed; stopping")
+                audit.write("stopping", reason="viewer closed", screenshots=len(shots.items))
+                on_viewers_gone()
+        viewer_joined()      # restart the countdown
+        gone_timer["task"] = asyncio.create_task(later())
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.state.controller = None
@@ -107,7 +135,7 @@ def create_app(backend, access, audit=None, screenshots=None):
         except KeyError:
             raise HTTPException(404) from None
 
-    last_shot = [0.0]
+    last_shot = [float("-inf")]   # the loop clock starts near 0 on a freshly booted machine
     shot_lock = asyncio.Lock()
 
     @app.get("/api/screenshots")
@@ -201,6 +229,7 @@ def create_app(backend, access, audit=None, screenshots=None):
             return
         # Claim before the first await: two connections cannot both become controller.
         app.state.controller = ws
+        viewer_joined()
         viewer = viewer_identity(ws.headers, peer)
         device = (backend.full_status().get("device") or {}).get("name")
         audit.write("view_start", viewer=viewer, device=device)
@@ -209,6 +238,7 @@ def create_app(backend, access, audit=None, screenshots=None):
             await session.serve(backend, ws, viewer=viewer)
         finally:
             app.state.controller = None
+            viewer_left()
             audit.write("view_end", viewer=viewer, device=device,
                         seconds=round(asyncio.get_running_loop().time() - started))
 
@@ -272,8 +302,11 @@ def parse_args(argv=None):
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser at startup")
     parser.add_argument("--audit-log", metavar="FILE", help="Append view start/end records (JSON lines)")
     parser.add_argument("--screenshot-dir", metavar="DIR",
-                        help="Keep screenshots in DIR (owner-only) so they survive a restart; "
-                             "default: in memory until PhoneView exits")
+                        help="Keep screenshots in owner-only files in DIR (one PhoneView per DIR) "
+                             "instead of memory. Either way they are deleted when PhoneView stops.")
+    parser.add_argument("--stop-when-closed", type=float, metavar="SECONDS",
+                        help="Stop (and delete the screenshots) when the page has been closed for "
+                             "SECONDS; a reload or short network drop within that time is fine")
     parser.add_argument("--exit-on-stdin-eof", action="store_true",
                         help="Exit when stdin closes (used when another program, such as ISDi, launches PhoneView)")
     parser.add_argument("--serial", help="adb serial or iPhone UDID to use when several are connected")
@@ -345,8 +378,14 @@ def main(argv=None):
         print(f"PhoneView: open {link}")
     for origin in args.public_origin:
         print(f"PhoneView: also reachable through the proxy at {origin} (append ?token=...)")
-    app = create_app(backend, access, AuditLog(args.audit_log), ScreenshotStore(args.screenshot_dir))
-    server = uvicorn.Server(server_config(app, args.port))
+    holder = {}
+
+    def stop():
+        holder["server"].should_exit = True
+    app = create_app(backend, access, AuditLog(args.audit_log), ScreenshotStore(args.screenshot_dir),
+                     on_viewers_gone=stop if args.stop_when_closed is not None else None,
+                     grace=args.stop_when_closed or 0)
+    server = holder["server"] = uvicorn.Server(server_config(app, args.port))
     if args.exit_on_stdin_eof:
         watch_stdin(server)
     if not args.no_browser:

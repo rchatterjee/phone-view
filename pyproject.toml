@@ -39,9 +39,9 @@ dependencies = [
 dev = ["httpx>=0.28,<1", "websockets>=12", "build", "twine"]
 
 [project.urls]
-Homepage = "https://github.com/rchatterjee/phone-controller"
-Source = "https://github.com/rchatterjee/phone-controller"
-Issues = "https://github.com/rchatterjee/phone-controller/issues"
+Homepage = "https://github.com/rchatterjee/phone-view"
+Source = "https://github.com/rchatterjee/phone-view"
+Issues = "https://github.com/rchatterjee/phone-view/issues"
 
 [project.scripts]
 phoneview = "phoneview.server:main"

@@ -5,10 +5,12 @@ stored as the original image plus a small record: when it was taken, from which
 device, its SHA-256, and a caption the consultant can edit. The order is the
 consultant's: they can move screenshots up and down before exporting.
 
-With a directory (ISDi passes its private screenshots directory) the images and
-an index.json survive a PhoneView restart; without one they live in memory until
-PhoneView exits. Files are written owner-only (0600 in a 0700 directory).
+Screenshots are temporary: they live in memory, or with a directory in owner-only
+files (0600 in a 0700 directory), and are deleted when PhoneView stops (`wipe`).
+Files a crashed run left behind are deleted when the next run starts, so use one
+directory per PhoneView instance.
 """
+import contextlib
 import datetime
 import hashlib
 import io
@@ -44,21 +46,36 @@ class ScreenshotStore:
         if self.dir is not None:
             self.dir.mkdir(parents=True, exist_ok=True)
             os.chmod(self.dir, 0o700)
-            self._load()
+            self._remove_files()     # left behind by a run that did not stop cleanly
 
-    # -- persistence -------------------------------------------------------------
+    # -- files -------------------------------------------------------------------
 
     def _index(self):
         return self.dir / "index.json"
 
-    def _load(self):
-        try:
-            items = json.loads(self._index().read_text(encoding="utf-8")).get("items", [])
-        except (OSError, ValueError):
-            items = []
-        self.items = [r for r in items
-                      if isinstance(r, dict) and ID_RE.match(str(r.get("id", "")))
-                      and r.get("mime") in MIME_EXT and self._path(r).exists()]
+    def _remove_files(self):
+        """Delete this store's files (screenshots and index), and nothing else."""
+        removed = 0
+        for path in self.dir.iterdir():
+            name = path.name
+            ours = name in ("index.json", "index.tmp") or (
+                path.suffix.lstrip(".") in MIME_EXT.values() and ID_RE.match(path.stem))
+            if ours and path.is_file():
+                path.unlink()
+                removed += 1
+        return removed
+
+    def wipe(self):
+        """Delete every screenshot, in memory and on disk. Returns how many there were."""
+        count = len(self.items)
+        self.items = []
+        self._memory.clear()
+        self._thumbs.clear()
+        if self.dir is not None and self.dir.exists():
+            self._remove_files()
+            with contextlib.suppress(OSError):
+                self.dir.rmdir()         # only if nothing else is in it
+        return count
 
     def _save_index(self):
         if self.dir is None:

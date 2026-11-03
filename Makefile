@@ -8,7 +8,7 @@
 
 PYTHON  ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 # The SSH remote isn't set up on this machine, so push over HTTPS (gh auth).
-REMOTE  ?= https://github.com/rchatterjee/phone-controller.git
+REMOTE  ?= https://github.com/rchatterjee/phone-view.git
 BRANCH  ?= main
 INIT    := src/phoneview/__init__.py
 CURRENT := $(shell sed -n 's/^__version__ = "\(.*\)"/\1/p' $(INIT))

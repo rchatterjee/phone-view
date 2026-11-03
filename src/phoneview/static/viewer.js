@@ -145,6 +145,8 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
   const list = $('shot-list'), takeBtn = $('shot-take'), pdfLink = $('shot-pdf'), clearBtn = $('shot-clear');
   const countEl = $('shot-count'), feedbackEl = $('shot-feedback'), emptyEl = $('shot-empty');
   let items = [], dragId = null;
+  let exportedState = null;   // what the last PDF download contained (ids + notes)
+  const state = () => JSON.stringify(items.map(i => [i.id, i.caption || '']));
   const nodes = new Map();   // id -> <li>, kept so thumbnails are not fetched again
 
   async function api(method, path, body) {
@@ -181,7 +183,12 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
     caption.rows = 2; caption.maxLength = 500; caption.placeholder = 'Note (included in the PDF)';
     caption.value = item.caption || '';
     caption.addEventListener('change', async () => {
-      try { await api('PATCH', full, {caption: caption.value}); say('Note saved.'); }
+      try {
+        const saved = await api('PATCH', full, {caption: caption.value});
+        const current = items.find(i => i.id === item.id);
+        if (current) current.caption = saved.caption;   // a changed note needs a new PDF
+        say('Note saved.');
+      }
       catch (e) { say(e.message); }
     });
     const tools = document.createElement('div');
@@ -280,6 +287,15 @@ if (typeof document !== 'undefined') document.addEventListener('DOMContentLoaded
       say(e.message);
     } finally {
       takeBtn.disabled = false;
+    }
+  });
+
+  // Screenshots are deleted when PhoneView stops, which it does once this page is closed.
+  pdfLink.addEventListener('click', () => { exportedState = state(); });
+  window.addEventListener('beforeunload', e => {
+    if (items.length && state() !== exportedState) {
+      e.preventDefault();
+      e.returnValue = '';   // the browser shows its own "Leave site?" dialog
     }
   });
 
