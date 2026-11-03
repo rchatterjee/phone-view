@@ -1,2 +1,2 @@
 """PhoneView: browser-based viewing and control of USB-connected phones."""
-__version__ = "0.2.0"
+__version__ = "1.0.0"
